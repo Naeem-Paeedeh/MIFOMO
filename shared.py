@@ -1,12 +1,3 @@
-# We borrowed the codes from the following repository (or repositories):
-# https://github.com/Naeem-Paeedeh/CPLSR
-# @article{paeedeh2025cross,
-#   title={Cross-Domain Few-Shot Learning with Coalescent Projections and Latent Space Reservation},
-#   author={Paeedeh, Naeem and Pratama, Mahardhika and Mayer, Wolfgang and Cao, Jimmy and Kowlczyk, Ryszard},
-#   journal={arXiv preprint arXiv:2507.15243},
-#   year={2025}
-# }
-
 import torch
 import numpy as np
 import torch.nn as nn
@@ -24,6 +15,7 @@ import shared as sh
 import logging
 # from scipy.stats import wasserstein_distance
 import ot
+import utils as utils
 
 
 # https://github.com/Naeem-Paeedeh/CPLSR
@@ -123,48 +115,7 @@ class _MovingAverage:
         self.sum = 0
 
 
-class ETA:
-    def __init__(self, total_tasks: int):
-        """Estimated remaining time
-
-        Args:
-            total_tasks (int): Total tasks to be performed
-        """
-        self.stopwatch = Stopwatch(['total'])
-        self.total_tasks = total_tasks
-        
-    def calculate(self, num_finished_tasks: int) -> str:
-        
-        result: str = self.stopwatch.calculate_estimate_remaining_time(key='total', total_tasks=self.total_tasks, num_finished_tasks=num_finished_tasks)
-        
-        return result
-    
-    def reset(self):
-        self.stopwatch.reset('total')
-
-
-class Stopwatch:
-    """
-    Stopwatch computes the time between start and stop.
-    Then we can add time to the total_elapsed_time dictionary by watch name.
-    """
-    def __init__(self, keys: list = None):
-        if keys is None:
-            keys = []
-        self._start_time = {k: time.time() for k in keys}
-
-    def reset(self, key):
-        self._start_time[key] = time.time()
-
-    def elapsed_time(self, key):
-        if key in self._start_time:
-            return time.time() - self._start_time[key]
-
-        self.reset(key)
-        return 0.0
-
-    @staticmethod
-    def convert_to_hours_minutes(time_in_seconds: float) -> str:
+def convert_to_hours_minutes(time_in_seconds: float) -> str:
         time_in_seconds = int(time_in_seconds)
         days = time_in_seconds // (24 * 3600)
         hours = (time_in_seconds % (24 * 3600)) // 3600
@@ -195,8 +146,55 @@ class Stopwatch:
             
         return res
 
+
+class ETA:
+    def __init__(
+        self,
+        total_tasks: int,
+    ):
+        """Estimated remaining time
+
+        Args:
+            total_tasks (int): Total tasks to be performed
+        """
+        self.stopwatch = Stopwatch(['total'])
+        self.total_tasks = total_tasks
+        
+    def calculate(self, num_finished_tasks: int) -> str:
+        
+        result: str = self.stopwatch.calculate_estimate_remaining_time(key='total', total_tasks=self.total_tasks, num_finished_tasks=num_finished_tasks)
+        
+        return result
+    
+    def reset(self):
+        self.stopwatch.reset('total')
+
+
+class Stopwatch:
+    """
+    Stopwatch computes the time between start and stop.
+    Then we can add time to the total_elapsed_time dictionary by watch name.
+    """
+    def __init__(
+        self,
+        keys: list = None,
+    ):
+        if keys is None:
+            keys = []
+        self._start_time = {k: time.perf_counter() for k in keys}
+
+    def reset(self, key):
+        self._start_time[key] = time.perf_counter()
+
+    def elapsed_time(self, key):
+        if key in self._start_time:
+            return time.perf_counter() - self._start_time[key]
+
+        self.reset(key)
+        return 0.0
+
     def elapsed_time_in_hours_minutes(self, key):
-        return self.convert_to_hours_minutes(self.elapsed_time(key))
+        return convert_to_hours_minutes(self.elapsed_time(key))
     
     def calculate_estimate_remaining_time(self, key, total_tasks, num_finished_tasks):
         total_time = self.elapsed_time(key)
@@ -204,7 +202,7 @@ class Stopwatch:
         if num_finished_tasks + 1 < total_tasks:
             remaining_time_str = estimated_remaining_time_string(total_time=total_time, total_tasks=total_tasks, num_finished_tasks=num_finished_tasks)
         else:
-            remaining_time_str = "Elapsed time: %s" % Stopwatch.convert_to_hours_minutes(total_time)
+            remaining_time_str = "Elapsed time: %s" % convert_to_hours_minutes(total_time)
             
         return remaining_time_str
 
@@ -213,12 +211,45 @@ class Stopwatch:
 
     def __getattr__(self, name: str):
         return self.elapsed_time(name)
+    
+
+class MyTimer:
+    """This timer can accumulate times while it can ignore some operations we don't want to measure.
+    """
+    def __init__(
+        self,
+        device
+    ):
+        assert device.type == "cuda"
+        
+        self.device = device
+        utils.synchronize(self.device)
+        
+        self._accumulated_time: float = 0.0
+        self.reset_start_time()
+        
+    def reset_start_time(self):
+        utils.synchronize(self.device)
+        self._start_time = time.perf_counter()
+        
+    def accumulate(self):
+        """It accumulates time and reset the start time.
+        """
+        utils.synchronize(self.device)
+        self._accumulated_time += time.perf_counter() - self._start_time
+        self._start_time = time.perf_counter()
+        
+    def obtain_accumulated_time_in_seconds(self):
+        return f"{self._accumulated_time:.6f}"
+    
+    def obtain_accumulated_time_str(self):
+        return convert_to_hours_minutes(self._accumulated_time)
 
 
 def estimated_remaining_time_string(total_time, total_tasks, num_finished_tasks: float):
     num_finished_tasks_from_one = num_finished_tasks + 1.0
     ert = (total_tasks - num_finished_tasks_from_one) * total_time / num_finished_tasks_from_one
-    res = "ETA: %s" % Stopwatch.convert_to_hours_minutes(ert)
+    res = "ETA: %s" % convert_to_hours_minutes(ert)
     return res
 
 
@@ -789,3 +820,13 @@ def highlighted_message(message: str, max_length: int = 60):
     margin = max_length - 4 - len(message) // 2   # :)
     result = '-' * margin + ' ' + message + ' ' + '-' * margin
     return result
+
+
+# We borrowed the codes from the following repository (or repositories):
+# https://github.com/Naeem-Paeedeh/CPLSR
+# @article{paeedeh2025cross,
+#   title={Cross-Domain Few-Shot Learning with Coalescent Projections and Latent Space Reservation},
+#   author={Paeedeh, Naeem and Pratama, Mahardhika and Mayer, Wolfgang and Cao, Jimmy and Kowlczyk, Ryszard},
+#   journal={arXiv preprint arXiv:2507.15243},
+#   year={2025}
+# }

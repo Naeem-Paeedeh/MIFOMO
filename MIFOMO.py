@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,7 +11,7 @@ from pathlib import Path
 import utils as utils
 
 import json
-from model.shared import CoalescentProjection
+from model.shared import CoalescentProjectionForHyperSIGMA, LoRAForHyperSIGMA, DeepPrompts
 from model.HyperSIGMA import HyperSIGMA
 from torch.distributions import Beta
 from torch import Tensor as T
@@ -25,16 +24,16 @@ import sys
 import platform
 import torchvision
 import GPUtil
+from copy import deepcopy
 
 
 class MIFOMO(nn.Module):
     def __init__(self, settings_file: str):
         super().__init__()
         
-        self.use_coalescent_projection: bool = True
         self.use_PCA: bool = True
         self.use_mapping: bool = False
-        self.use_label_smoothing: bool = True
+        self.use_label_propagation: bool = True
         self.use_mixup = True
         
         self.settings_file = settings_file
@@ -49,6 +48,8 @@ class MIFOMO(nn.Module):
         
         self.phase = nt.Phase.Source
         
+        self.full_fine_tuning: bool = False
+        
         self.lr_default = 1e-4
         self.lr_model = 1e-4
         self.lr_mapping = 1e-4
@@ -60,6 +61,8 @@ class MIFOMO(nn.Module):
         self.dampening = 0.9
         self.weight_decay = 0.05
         
+        self.perturbation_range = 0.2
+        
         self.temperature_mixup_scheduler = 0.05
         
         self.seed = 0
@@ -67,7 +70,6 @@ class MIFOMO(nn.Module):
         self.num_episodes_source = 1000
         self.num_episodes_intermediate_domain = 500
         self.num_episodes_target1 = 1000
-        self.num_episodes_target2 = 1000
         self.num_episodes_tests = 20
         
         self.dataset_name_source = 'Chikusei'
@@ -121,12 +123,30 @@ class MIFOMO(nn.Module):
         
         self.max_epoch = 500    # Default: 500
         self.batch_size_LGC = 80
+        self.LGC_alpha: float = 0.9
+        self.LGC_sigma: float = 50
         
         self.gt_matrix_target: T = None
         self.gt_matrix_test_target: T = None
-
-        self.coalescent_projection_spat: CoalescentProjection = None
-        self.coalescent_projection_spec: CoalescentProjection = None
+        
+        self.PEFT_type = nt.PEFT_Type.CoalescentProjection
+        
+        # Coalescent Projection
+        self.CPs: CoalescentProjectionForHyperSIGMA = None
+        self.CPs_shared_across_heads = False
+        
+        # LoRA
+        self.LoRAs: LoRAForHyperSIGMA = None
+        self.LoRAs_downsize_spat = 3
+        self.LoRAs_downsize_spec = 3
+        self.LoRA_qkv_mask = [True, False, True]
+        
+        # Prompt
+        self.prompts: DeepPrompts = None
+        self.num_prompts_spat: int = 8
+        self.num_prompts_spec: int = 8
+        
+        self.flag_number_of_parameters_are_printed = False
         
         self.parameter_names_shared = set()                         # Parameter names that can be found both in the checkpoint and the model's state dictionary.
         self.parameter_names_only_available_in_checkpoints = set()  # We can recover them from the checkpoint
@@ -183,8 +203,8 @@ class MIFOMO(nn.Module):
         os.makedirs(os.path.join(self.dir_cache, 'temp'), exist_ok=True)      # As a temporary cache directory.
         os.makedirs(self.dir_saves, exist_ok=True)
         
-        assert self.dataset_name_source == 'Chikusei'
-        assert self.dataset_name_target in ['PaviaU', 'IndianPines', 'Salinas', 'Houston', 'PaviaC', 'HHK']
+        assert self.dataset_name_source in ['Chikusei', 'KSC']
+        assert self.dataset_name_target in ['PaviaU', 'IndianPines', 'Salinas', 'Houston', 'PaviaC', 'HHK', 'KSC']
         
         self.device = torch.device(self.device if torch.cuda.is_available() else "cpu")
         
@@ -252,7 +272,10 @@ class MIFOMO(nn.Module):
             device=self.device,
         )
         
-    def generate_an_episode(self, source_or_target: bool):
+    def generate_an_episode(
+        self,
+        source_or_target: bool
+    ):
         
         if source_or_target:
             episode = self.source_EpisodeGenerator.generate()
@@ -263,7 +286,9 @@ class MIFOMO(nn.Module):
         
         return episode
     
-    def suffix_for_dataset_cache_files(self):
+    def suffix_for_dataset_cache_files(
+        self
+    ):
         res: str = f',patch_size={self.patch_size}'
         
         if self.use_PCA:
@@ -271,11 +296,16 @@ class MIFOMO(nn.Module):
         else:
             res += "Without_PCA"
             
+        res += f",PEFT={self.PEFT_type}"
+            
         res += ".pth"
         
         return res
     
-    def suffix_for_files(self, num_episodes: int = -1):
+    def suffix_for_files(
+        self,
+        num_episodes: int = -1
+    ):
         res: str = f',patch_size={self.patch_size}'
         
         if self.use_PCA:
@@ -287,6 +317,8 @@ class MIFOMO(nn.Module):
             res += ",with_mapping"
         else:
             res += ",WO_mapping"
+            
+        res += f",PEFT={self.PEFT_type}"
             
         num_episodes_str = ''
             
@@ -312,7 +344,9 @@ class MIFOMO(nn.Module):
             
         return res
     
-    def _load_datasets(self):
+    def _load_datasets(
+        self
+    ):
         
         os.makedirs(self.dir_cache, exist_ok=True)
         
@@ -414,7 +448,10 @@ class MIFOMO(nn.Module):
         # assert sum([len(self.label_to_indices_source[lbl]) for lbl in range(self.num_classes_source)]) == len(self.labels_source)
         # assert sum([len(self.label_to_indices_target[lbl]) for lbl in range(self.num_classes_target)]) == len(self.labels_target)
             
-    def _obtain_input_image(self, source_or_target: bool):
+    def _obtain_input_image(
+        self,
+        source_or_target: bool
+    ):
         if source_or_target:
             dataset_name = self.dataset_name_source
             path_dataset = os.path.join(self.datasets_root_dir, self.path_source_dataset)
@@ -452,7 +489,10 @@ class MIFOMO(nn.Module):
         
         return image    # data.shape: [20, image_heght, image_width]
         
-    def _obtain_ground_truth_dataset(self, source_or_target: bool):
+    def _obtain_ground_truth_dataset(
+        self,
+        source_or_target: bool
+    ):
         if source_or_target:
             dataset_name = self.dataset_name_source
             path_ground_truth = os.path.join(self.datasets_root_dir, self.path_source_ground_truth)
@@ -494,13 +534,51 @@ class MIFOMO(nn.Module):
         
         return gt_matrix, gt_matrix_test
         
-    def reinitialize_the_coalescent_projecitons(self):
-        if self.use_coalescent_projection:
-            self.coalescent_projection_spat = CoalescentProjection(dim_embed=self.model.spat_encoder.dim_embed, num_heads=self.model.spat_encoder.num_heads, num_layers=self.model.spat_encoder.num_layers, device=self.device)
-            self.coalescent_projection_spec = CoalescentProjection(dim_embed=self.model.spec_encoder.dim_embed, num_heads=self.model.spat_encoder.num_heads, num_layers=self.model.spat_encoder.num_layers, device=self.device)
+    def reinitialize_the_coalescent_projecitons(
+        self
+    ):
+        if self.PEFT_type == nt.PEFT_Type.CoalescentProjection:
+            self.CPs = CoalescentProjectionForHyperSIGMA(
+                dim_embed_spat=self.model.spat_encoder.dim_embed,   # 768
+                dim_embed_spec=self.model.spec_encoder.dim_embed,   # 768
+                num_heads_spat=self.model.spat_encoder.num_heads,   # 12
+                num_heads_spec=self.model.spec_encoder.num_heads,   # 12
+                num_layers_spat=self.model.spat_encoder.num_layers, # 12
+                num_layers_spec=self.model.spec_encoder.num_layers, # 12
+                shared_across_heads=self.CPs_shared_across_heads,
+                device=self.device
+            )
+        elif self.PEFT_type == nt.PEFT_Type.LoRA:
+            self.LoRAs = LoRAForHyperSIGMA(
+                dim_embed_spat=self.model.spat_encoder.dim_embed,
+                dim_embed_spec=self.model.spec_encoder.dim_embed,
+                downsize_dim_spat=self.LoRAs_downsize_spat,
+                downsize_dim_spec=self.LoRAs_downsize_spec,
+                qkv_mask=self.LoRA_qkv_mask,
+                num_layers_spat=self.model.spat_encoder.num_layers,
+                num_layers_spec=self.model.spec_encoder.num_layers,
+                device=self.device
+            )
+        elif self.PEFT_type == nt.PEFT_Type.Prompt:
+            self.prompts = DeepPrompts(
+                num_prompts_spat=self.num_prompts_spat,
+                num_prompts_spec=self.num_prompts_spec,
+                dim_embed_spat=self.model.spat_encoder.dim_embed,
+                dim_embed_spec=self.model.spec_encoder.dim_embed,
+                num_layers_spat=self.model.spat_encoder.num_layers,
+                num_layers_spec=self.model.spec_encoder.num_layers,
+                device=self.device
+            )
+        elif self.PEFT_type == nt.PEFT_Type.Disabled:
+            pass
+        else:
+            raise NotImplementedError()
     
     # https://github.com/WHU-Sigma/HyperSIGMA
-    def prepare_the_model(self, source_or_target: bool):
+    def prepare_the_model(
+        self,
+        source_or_target: bool
+    ):
         
         if source_or_target:
             num_classes = self.num_classes_source
@@ -652,12 +730,17 @@ class MIFOMO(nn.Module):
         
         self.model = self.model.to(self.device)
         
-    def reset_the_model(self):
+    def reset_the_model(
+        self
+    ):
         self._load_dict(self.initial_state_dict)
         self._freeze_or_unfreeze_the_required_components()
         self.missed_cache_before = False
         
-    def _load_dict(self, state_dict: dict):
+    def _load_dict(
+        self,
+        state_dict: dict
+    ):
         if self.use_mapping and 'mapping_source' in state_dict.keys() or 'mapping_target' in state_dict.keys():
             self.mapping_source.load_state_dict(state_dict['mapping_source'])
             
@@ -667,16 +750,34 @@ class MIFOMO(nn.Module):
             else:
                 raise NotImplementedError
             
-        if self.use_coalescent_projection:
-            assert 'coalescent_projection_spat' in state_dict.keys() and 'coalescent_projection_spec' in state_dict.keys()
-            self.coalescent_projection_spat.load_state_dict(state_dict['coalescent_projection_spat'])
-            self.coalescent_projection_spec.load_state_dict(state_dict['coalescent_projection_spec'])
+        if self.PEFT_type == nt.PEFT_Type.CoalescentProjection:
+            if 'CPs' in state_dict.keys():
+                self.CPs.load_state_dict(state_dict['CPs'], strict=True)
+            
+            keys_list = list(self.CPs.CP_dict.keys())
+            if self.CPs_shared_across_heads:
+                assert self.CPs.CP_dict[keys_list[0]].dim() == 2
+            else:
+                assert self.CPs.CP_dict[keys_list[0]].dim() == 3
+        elif self.PEFT_type == nt.PEFT_Type.LoRA:
+            if 'LoRAs' in state_dict.keys():
+                self.LoRAs.load_state_dict(state_dict['LoRAs'])
+        elif self.PEFT_type == nt.PEFT_Type.Prompt:
+            if 'prompts' in state_dict.keys():
+                self.prompts.load_state_dict(state_dict['prompts'])
+        elif self.PEFT_type == nt.PEFT_Type.Disabled:
+            pass
+        else:
+            raise NotImplementedError()
             
         self.prototypical_classifier.load_state_dict(state_dict['prototypical_classifier'])
             
         self.model.load_state_dict(state_dict, strict=False)
-    
-    def load(self, file_path: str):
+        
+    def load(
+        self,
+        file_path: str
+    ):
         parameters_dict: dict = torch.load(file_path, weights_only=False)
         
         self._load_dict(parameters_dict)
@@ -685,7 +786,13 @@ class MIFOMO(nn.Module):
         
         logging.info(f'"{file_path}" is loaded!')
         
-    def save(self, file_name: str, num_episodes: int = -1, cache: bool = False, **kwargs):
+    def save(
+        self,
+        file_name: str,
+        num_episodes: int = -1,
+        cache: bool = False,
+        **kwargs
+    ):
         model_dict = self.obtain_parameters_dictionary_to_save()
         
         model_dict['extra_details'] = kwargs
@@ -702,7 +809,10 @@ class MIFOMO(nn.Module):
         
         logging.info(f'The model is saved in the "{path}"')
         
-    def try_cache_first(self, file_path: str = None):
+    def try_cache_first(
+        self,
+        file_path: str = None
+    ):
         if file_path is None or file_path == '' or self.disable_caching_mechanism:
             return False
         file_path = os.path.join(self.dir_cache, 'temp', file_path)
@@ -714,7 +824,10 @@ class MIFOMO(nn.Module):
         self.missed_cache_before = True     # After this, we must ignore the cache files. Therfore, the program overwrite the next cache files!
         return False
         
-    def obtain_parameters_dictionary_to_save(self, ignore_frozen_parameters: bool = True) -> dict:
+    def obtain_parameters_dictionary_to_save(
+        self,
+        ignore_frozen_parameters: bool = True
+    ) -> dict:
         # We exclude the blocks as they are frozen
         parameters_dict_to_save = self.model.state_dict()
         keys = list(parameters_dict_to_save.keys())
@@ -730,15 +843,28 @@ class MIFOMO(nn.Module):
             parameters_dict_to_save['mapping_source'] = self.mapping_source.state_dict()
             parameters_dict_to_save['mapping_target'] = self.mapping_target.state_dict()
             
-        if self.use_coalescent_projection:
-            parameters_dict_to_save['coalescent_projection_spat'] = self.coalescent_projection_spat.state_dict()
-            parameters_dict_to_save['coalescent_projection_spec'] = self.coalescent_projection_spec.state_dict()
+        if self.PEFT_type == nt.PEFT_Type.CoalescentProjection:
+            parameters_dict_to_save['CPs'] = self.CPs.state_dict()
+        elif self.PEFT_type == nt.PEFT_Type.LoRA:
+            parameters_dict_to_save['LoRAs'] = self.LoRAs.state_dict()
+        elif self.PEFT_type == nt.PEFT_Type.Prompt:
+            parameters_dict_to_save['prompts'] = self.prompts.state_dict()
+        elif self.PEFT_type == nt.PEFT_Type.Disabled:
+            pass
+        else:
+            raise NotImplementedError()
             
         parameters_dict_to_save['prototypical_classifier'] = self.prototypical_classifier.state_dict()
         
+        parameters_dict_to_save = deepcopy(parameters_dict_to_save)
+        
         return parameters_dict_to_save
     
-    def forward(self, x: T, source_or_target: bool):        # source_or_target is just for mapping.
+    def forward(
+        self,
+        x: T,
+        source_or_target: bool
+    ):        # source_or_target is just for mapping.
         # x.shape = [batch_size, num_bands, patch_heigh, patch_width]
         x = x.to(self.device)
         
@@ -747,13 +873,38 @@ class MIFOMO(nn.Module):
                 x = self.mapping_source.forward(x)
             else:                   # Target
                 x = self.mapping_target.forward(x)
+                
+        PEFT_parameters = dict()
+        
+        if self.PEFT_type == nt.PEFT_Type.CoalescentProjection:
+            PEFT_parameters = dict(
+                CPs=self.CPs,
+            )
+        elif self.PEFT_type == nt.PEFT_Type.LoRA:
+            PEFT_parameters = dict(
+                LoRAs = self.LoRAs
+            )
+        elif self.PEFT_type == nt.PEFT_Type.Prompt:
+            PEFT_parameters = dict(
+                prompts = self.prompts
+            )
+        elif self.PEFT_type == nt.PEFT_Type.Disabled:
+            pass
+        else:
+            raise NotImplementedError()
             
-        x = self.model.forward(x, coalescent_projection_spat=self.coalescent_projection_spat, coalescent_projection_spec=self.coalescent_projection_spec)
+        x = self.model.forward(
+            x=x,
+            **PEFT_parameters
+        )
         
         return x
         
     # https://github.com/Naeem-Paeedeh/CPLSR
-    def _freeze_or_unfreeze_the_required_components(self, learnable_HyperSIGMA_parameters: bool = True):
+    def _freeze_or_unfreeze_the_required_components(
+        self,
+        learnable_HyperSIGMA_parameters: bool = True
+    ):
             
         def it_is_not_learnable(model):
             return model is None or type(model) in [int, float, list, dict]
@@ -793,7 +944,7 @@ class MIFOMO(nn.Module):
                         if hasattr(param, 'requires_grad'):
                             param.requires_grad = requires_grad
                             
-        freeze_or_unfreeze_parameters(model=self.model, requires_grad=False)
+        freeze_or_unfreeze_parameters(model=self.model, requires_grad=self.full_fine_tuning)
         
         # We unfreeze the randomly initialized parameters.
         if self.phase == nt.Phase.Source:
@@ -813,9 +964,16 @@ class MIFOMO(nn.Module):
                 requires_grad=learnable_HyperSIGMA_parameters
             )  # '.pos_embed'
         
-        if self.use_coalescent_projection:
-            freeze_or_unfreeze_parameters(model=self.coalescent_projection_spat, requires_grad=True)
-            freeze_or_unfreeze_parameters(model=self.coalescent_projection_spec, requires_grad=True)
+        if self.PEFT_type == nt.PEFT_Type.CoalescentProjection:
+            freeze_or_unfreeze_parameters(model=self.CPs, requires_grad=True)
+        elif self.PEFT_type == nt.PEFT_Type.LoRA:
+            freeze_or_unfreeze_parameters(model=self.LoRAs, requires_grad=True)
+        elif self.PEFT_type == nt.PEFT_Type.Prompt:
+            freeze_or_unfreeze_parameters(model=self.prompts, requires_grad=True)
+        elif self.PEFT_type == nt.PEFT_Type.Disabled:
+            pass
+        else:
+            raise NotImplementedError()
             
         if self.use_mapping:
             freeze_or_unfreeze_parameters(model=self.mapping_source, requires_grad=True)
@@ -877,9 +1035,17 @@ class MIFOMO(nn.Module):
         
         params_all += get_params_groups(self.model, lr=self.lr_model, name_model='ViTs', force_considering_as_non_reqularized=False)
         
-        params_all += get_params_groups(self.coalescent_projection_spat, lr=self.lr_PEFT, name_model='coalescent_projection_spat', force_considering_as_non_reqularized=True)
-        
-        params_all += get_params_groups(self.coalescent_projection_spec, lr=self.lr_PEFT, name_model='coalescent_projection_spec', force_considering_as_non_reqularized=True)
+        if self.PEFT_type == nt.PEFT_Type.CoalescentProjection:
+            params_all += get_params_groups(self.CPs, lr=self.lr_PEFT, name_model='Coalescent_Projections', force_considering_as_non_reqularized=True)
+        elif self.PEFT_type == nt.PEFT_Type.LoRA:
+            params_all += get_params_groups(self.LoRAs, lr=self.lr_PEFT, name_model='LoRAs', force_considering_as_non_reqularized=True)
+        elif self.PEFT_type == nt.PEFT_Type.Prompt:
+            params_all += get_params_groups(self.prompts, lr=self.lr_PEFT, name_model='Prompts', force_considering_as_non_reqularized=True)
+        elif self.PEFT_type == nt.PEFT_Type.Disabled:
+            pass
+        else:
+            raise NotImplementedError()
+            
         
         params_all += get_params_groups(self.prototypical_classifier, lr=self.lr_temperature_prototypical_classifier, name_model='prototypical_classifier.temperature')
         
@@ -890,6 +1056,10 @@ class MIFOMO(nn.Module):
         if component_additional is not None:
             params_all += get_params_groups(component_additional, lr=lr_component, name_model="Additional component")
             raise NotImplementedError
+        
+        if not self.flag_number_of_parameters_are_printed:
+            utils.show_number_of_parameters_in_pramas_groups(params_all=params_all, logger=logging)
+            self.flag_number_of_parameters_are_printed = True
             
         optimizer = None
             
@@ -924,14 +1094,19 @@ class MIFOMO(nn.Module):
         
         return optimizer
     
-    def train(self, mode: bool = True):
+    def train(
+        self,
+        mode: bool = True
+    ):
         super().train(mode)
         
         self.model.train(mode)
         
         return self
     
-    def _prepare_logger(self):
+    def _prepare_logger(
+        self
+    ):
         os.makedirs(self.dir_log, exist_ok=True)
         
         if self.phase == nt.Phase.Source:
@@ -956,7 +1131,22 @@ class MIFOMO(nn.Module):
             ],
         )
         
-    def print_arguments(self):
+        # Global exception handler
+        def global_exception_handler(exc_type, exc_value, exc_traceback):
+            # Ignore KeyboardInterrupt so a console python program can exit with Ctrl + C
+            if issubclass(exc_type, KeyboardInterrupt):
+                sys.__excepthook__(exc_type, exc_value, exc_traceback)
+                return
+
+            # Log the error and the traceback
+            logging.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+        # Assign your custom handler to sys.excepthook
+        sys.excepthook = global_exception_handler
+        
+    def print_arguments(
+        self
+    ):
         
         printable_types_of_attributes = {int, float, str, list, bool, tuple, dict, torch.device, Path}
         
@@ -1008,7 +1198,7 @@ class MixupScheduler:
         total_iterations: int,
         temperature: float,
         perturbation_range: float = 0.2,  # Sigma in the paper
-        epsilon: float = 1e-8,
+        epsilon: float = 1e-8
     ):
         self.lmbda = 0.0     # It should be close to the target domain at the beginning.
         self.total_iterations = total_iterations
@@ -1078,3 +1268,5 @@ class MixupScheduler:
 # }
 
 # https://github.com/Naeem-Paeedeh/CONEC-LoRA
+
+# https://github.com/Naeem-Paeedeh/CVLC

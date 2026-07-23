@@ -20,13 +20,13 @@ from functools import partial
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
-from model.shared import CoalescentProjection
 import einops as eo
 from timm.layers import drop_path, to_2tuple, trunc_normal_
 from mmengine.dist import get_dist_info
 from torch.nn.init import constant_, xavier_uniform_
-from model.shared import Block, obtain_prompts_with_layer_id
+from model.shared import Block
 from torch import Tensor as T
+from model.shared import CoalescentProjectionForHyperSIGMA, LoRAForHyperSIGMA, LoRA_QKV, DeepPrompts, Prompt
 
 
 # The Spatial branch maps all bands in each pixel and use it as one of the tokens.
@@ -304,7 +304,13 @@ class SpatialViT(nn.Module):        # Class SpatViT
     def no_weight_decay(self):
         return {'pos_embed', 'cls_token'}
 
-    def forward(self, x: T, coalescent_projection_dict: dict = None):
+    def forward(
+        self,
+        x: T,
+        CPs: CoalescentProjectionForHyperSIGMA = None,
+        LoRAs: LoRAForHyperSIGMA = None,
+        prompts: DeepPrompts = None
+    ):
         (a, c, h, w) = x.shape
         
         # x.shape: [1, 20, 145, 145]
@@ -323,24 +329,56 @@ class SpatialViT(nn.Module):        # Class SpatViT
             x = x + self.pos_embed
         x = self.pos_drop(x)        # x.shape: [1, 256, 768]
         features_chosen_layers_list = []
-        for i, blk in enumerate(self.blocks):
+        for layer_number, blk in enumerate(self.blocks):
             
-            if i > max(self.out_indices):
+            if layer_number > max(self.out_indices):
                 break
             
-            coalescent_projections_current_layer = None
+            CP_QK_current_layer: T = None
+            CP_SV_current_layer: T = None
+            LoRAs_current_layer: LoRA_QKV = None
             
-            if coalescent_projection_dict is not None:
-                coalescent_projections_current_layer = obtain_prompts_with_layer_id(coalescent_projection_dict, i)
+            if CPs is not None:
+                CP_QK_current_layer, CP_SV_current_layer = CPs.obtain_CP_spat_for_a_layer(layer_number)
+                
+            if LoRAs is not None:
+                LoRAs_current_layer = LoRAs.obtain_LoRAs_spat_for_a_layer(layer_number)
+                
+            if prompts is not None:
+                prompt_obj: Prompt = prompts.obtain_prompts_spat_for_a_layer(layer_number)
+                prompt = prompt_obj.prompt.unsqueeze(0).expand(x.shape[0], -1, -1)
+                
+                # x.shape: [batch_size, seq_length, dim_embed]
+                # prompt.shape: [batch_size, num_prompts, dim_embed] 
+                if layer_number == 0:
+                    x = torch.cat([prompt, x], dim=1)
+                else:
+                    # Drop previous prompts and replace them with current layer's prompts
+                    x = torch.cat([prompt, x[:, prompts.num_prompts_spat:]], dim=1)
             
             if self.use_checkpoint:
-                x = checkpoint.checkpoint(blk, x, coalescent_projections_current_layer, use_reentrant=False)
+                x = checkpoint.checkpoint(
+                    blk,
+                    x,
+                    CP_QK_current_layer,
+                    CP_SV_current_layer,
+                    LoRAs_current_layer,
+                    use_reentrant=False
+                )
             else:
-                x = blk.forward(x, coalescent_projection=coalescent_projections_current_layer)
+                x = blk.forward(
+                    x,
+                    CP_QK=CP_QK_current_layer,
+                    CP_SV=CP_SV_current_layer,
+                    lora_qkv=LoRAs_current_layer
+                )
                 
             # self.out_indices == [3, 5, 7, 11]
-            if i in self.out_indices:
-                features_chosen_layers_list.append(x)
+            if layer_number in self.out_indices:
+                if prompts is None:
+                    features_chosen_layers_list.append(x)
+                else:
+                    features_chosen_layers_list.append(x[:, prompts.num_prompts_spat:])
         
         # The shapes become: [batch_size, dim_embed, patch_size, patch_size]
 
@@ -352,11 +390,11 @@ class SpatialViT(nn.Module):        # Class SpatViT
         
         ops = [self.fpn1, self.fpn2, self.fpn3, self.fpn4]
         
-        for i in range(len(ops)):
-            x = features_chosen_layers_list[i]      # The shape of all features were [batch_size, 81, 768]
+        for layer_number in range(len(ops)):
+            x = features_chosen_layers_list[layer_number]      # The shape of all features were [batch_size, 81, 768]
             x = eo.rearrange(x, 'b (h w) d -> b d h w', h=self.patch_size, w=self.patch_size)
-            x = ops[i].forward(x)
-            features_chosen_layers_list[i] = upsampling(x)
+            x = ops[layer_number].forward(x)
+            features_chosen_layers_list[layer_number] = upsampling(x)
         
         # The shape four outputs: [batch_size, 768, 9, 9]
         return features_chosen_layers_list
@@ -532,8 +570,13 @@ class SpectralViT(nn.Module):       # class SpectralVisionTransformer
     def no_weight_decay(self):
         return {'pos_embed', 'cls_token'}
 
-    def forward(self, x: T, coalescent_projection_dict: dict = None):
-
+    def forward(
+        self,
+        x: T,
+        CPs: CoalescentProjectionForHyperSIGMA = None,
+        LoRAs: LoRAForHyperSIGMA = None,
+        prompts: DeepPrompts = None
+    ):
         # x.shape: [batch_size, num_bands, patch_size, patch_size]
         # B, C, H, W = x.shape
         x = self.patch_embed.forward(x)  # B, N, C
@@ -561,30 +604,62 @@ class SpectralViT(nn.Module):       # class SpectralVisionTransformer
 
         features = []
         
-        for i, blk in enumerate(self.blocks):
+        for layer_number, blk in enumerate(self.blocks):
             
-            if i > max(self.out_indices):
+            if layer_number > max(self.out_indices):
                 break
             
-            coalescent_projections_current_layer = None
+            CP_QK_current_layer: T = None
+            CP_SV_current_layer: T = None
+            LoRAs_current_layer: LoRA_QKV = None
             
-            if coalescent_projection_dict is not None:
-                coalescent_projections_current_layer = obtain_prompts_with_layer_id(coalescent_projection_dict, i)
+            if CPs is not None:
+                CP_QK_current_layer, CP_SV_current_layer = CPs.obtain_CP_spec_for_a_layer(layer_number)
+                
+            if LoRAs is not None:
+                LoRAs_current_layer = LoRAs.obtain_LoRAs_spec_for_a_layer(layer_number)
+                
+            if prompts is not None:
+                prompt_obj: Prompt = prompts.obtain_prompts_spec_for_a_layer(layer_number)
+                prompt = prompt_obj.prompt.unsqueeze(0).expand(x.shape[0], -1, -1)
+                
+                # x.shape: [batch_size, seq_length, dim_embed]
+                # prompt.shape: [batch_size, num_prompts, dim_embed] 
+                if layer_number == 0:
+                    x = torch.cat([prompt, x], dim=1)
+                else:
+                    # Drop previous prompts and replace them with current layer's prompts
+                    x = torch.cat([prompt, x[:, prompts.num_prompts_spec:]], dim=1)
             
             if self.use_checkpoint:
-                x = checkpoint.checkpoint(blk, x, coalescent_projections_current_layer, use_reentrant=False)
+                x = checkpoint.checkpoint(
+                    blk,
+                    x,
+                    CP_QK_current_layer,
+                    CP_SV_current_layer,
+                    LoRAs_current_layer,
+                    use_reentrant=False
+                )
             else:
-                x = blk.forward(x, coalescent_projection=coalescent_projections_current_layer)
+                x = blk.forward(
+                    x,
+                    CP_QK=CP_QK_current_layer,
+                    CP_SV=CP_SV_current_layer,
+                    lora_qkv=LoRAs_current_layer
+                )
                 
-            if i in self.out_indices:  # self.out_indices = [3]
-                features.append(x)  # b, channels, embed_dim
-
+            if layer_number in self.out_indices:  # self.out_indices = [3]
+                if prompts is None:
+                    features.append(x)  # b, channels, embed_dim
+                else:
+                    features.append(x[:, prompts.num_prompts_spec:])
+                
         # features = list(map(lambda x: x.permute(0, 2, 1).reshape(B, -1, H, W), features))
 
         # features[0].shape: [batch_size, num_tokens, dim_embed]
         ops = [self.l1]
-        for i in range(len(ops)):
-            features[i] = ops[i](features[i])
+        for layer_number in range(len(ops)):
+            features[layer_number] = ops[layer_number](features[layer_number])
 
         # features[0].shape: [1, 100, 128]
         return features
@@ -729,62 +804,71 @@ class HyperSIGMA(torch.nn.Module):       # class SSFusionFramework
             nn.Sigmoid(),
         )
         
-    def forward(self, x: T, coalescent_projection_spat: CoalescentProjection = None, coalescent_projection_spec: CoalescentProjection = None, use_spat_encoder: bool = True, use_spec_encoder: bool = True):
+    def forward(
+        self,
+        x: T,
+        CPs: CoalescentProjectionForHyperSIGMA = None,
+        LoRAs: LoRAForHyperSIGMA = None,
+        prompts: DeepPrompts = None
+        # use_spat_encoder: bool = True,
+        # use_spec_encoder: bool = True
+    ):
         # x.shape: [batch_size, 20, 9, 9]
         
-        assert use_spat_encoder or use_spec_encoder
+        # assert use_spat_encoder or use_spec_encoder
         
-        CP_dict_spatial = None
-        CP_dict_spectral = None
-        
-        if coalescent_projection_spat is not None:
-            CP_dict_spatial = coalescent_projection_spat.CP_dict
-        
-        if coalescent_projection_spec is not None:
-            CP_dict_spectral = coalescent_projection_spec.CP_dict
-
         # x: (b, c, h, w)
         # ts:(b, c)
         
         batch_size, num_bands, h, w = x.shape
 
-        if use_spat_encoder:
-            # Their shape becomes: [1, 768, 9, 9]
-            features_spatial_chosen_layers_list = self.spat_encoder.forward(x, coalescent_projection_dict=CP_dict_spatial)
+        # if use_spat_encoder:
+        # Their shape becomes: [1, 768, 9, 9]
+        features_spatial_chosen_layers_list = self.spat_encoder.forward(
+            x=x,
+            CPs=CPs,
+            LoRAs=LoRAs,
+            prompts=prompts
+        )
 
         spec_weights_list = []
         
-        if use_spec_encoder:
-            spec_feature = self.spec_encoder.forward(x, coalescent_projection_dict=CP_dict_spectral)
-        
-            spec_feature = spec_feature[0]      # Its shape: [batch_size, num_tokens_spectral, 128]
+        # if use_spec_encoder:
+        spec_feature = self.spec_encoder.forward(
+            x=x,
+            CPs=CPs,
+            LoRAs=LoRAs,
+            prompts=prompts
+        )
+    
+        spec_feature = spec_feature[0]      # Its shape: [batch_size, num_tokens_spectral, 128]
 
-            spec_feature = self.pool(spec_feature)  # [batch_size, num_tokens_spectral, 1]
-            spec_feature = spec_feature.view(batch_size, -1)  # b, c  -> [1, 100]
+        spec_feature = self.pool(spec_feature)  # [batch_size, num_tokens_spectral, 1]
+        spec_feature = spec_feature.view(batch_size, -1)  # b, c  -> [1, 100]
 
-            spec_weights_list.append(self.mlp_spec1(spec_feature).view(batch_size, -1, 1, 1))   # Its shape: [batch_size, 768, 1, ,1]
-            spec_weights_list.append(self.mlp_spec2(spec_feature).view(batch_size, -1, 1, 1))   # Its shape: [batch_size, 768, 1, ,1]
-            spec_weights_list.append(self.mlp_spec3(spec_feature).view(batch_size, -1, 1, 1))   # Its shape: [batch_size, 768, 1, ,1]
-            spec_weights_list.append(self.mlp_spec4(spec_feature).view(batch_size, -1, 1, 1))   # Its shape: [batch_size, 768, 1, ,1]
+        spec_weights_list.append(self.mlp_spec1(spec_feature).view(batch_size, -1, 1, 1))   # Its shape: [batch_size, 768, 1, ,1]
+        spec_weights_list.append(self.mlp_spec2(spec_feature).view(batch_size, -1, 1, 1))   # Its shape: [batch_size, 768, 1, ,1]
+        spec_weights_list.append(self.mlp_spec3(spec_feature).view(batch_size, -1, 1, 1))   # Its shape: [batch_size, 768, 1, ,1]
+        spec_weights_list.append(self.mlp_spec4(spec_feature).view(batch_size, -1, 1, 1))   # Its shape: [batch_size, 768, 1, ,1]
         
         features_fused_list = []
         
-        if use_spat_encoder:
-            for i in range(len(self.chosen_layers_spatial)):
-                x = features_spatial_chosen_layers_list[i]
-                if use_spec_encoder:
-                    x = x * (1 + spec_weights_list[i])  # [batch_size, dim_embed, 1, ,1] * [1, dim_embed, patch_size, patch_size] -> [batch_size, dim_embed, patch_size, patch_size]  # dim_embed = 768
-                    
-                x = eo.rearrange(x, 'b d h w -> b h w d')       # [batch_size, patch_size, patch_size, dim_embed]  # dim_embed = 768
+        # if use_spat_encoder:
+        for i in range(len(self.chosen_layers_spatial)):
+            x = features_spatial_chosen_layers_list[i]
+            # if use_spec_encoder:
+            x = x * (1 + spec_weights_list[i])  # [batch_size, dim_embed, 1, ,1] * [1, dim_embed, patch_size, patch_size] -> [batch_size, dim_embed, patch_size, patch_size]  # dim_embed = 768
                 
-                features_fused_list.append(x)
+            x = eo.rearrange(x, 'b d h w -> b h w d')       # [batch_size, patch_size, patch_size, dim_embed]  # dim_embed = 768
+            
+            features_fused_list.append(x)
         
         # Their shape was [batch_size, patch_size, patch_size, dim_embed]  # dim_embed = 768
         # Their shape become [batch_size, patch_size, patch_size, 128]
         features_fused_list[0] = self.DR1.forward(features_fused_list[0])
-        features_fused_list[1] = self.DR1.forward(features_fused_list[1])
-        features_fused_list[2] = self.DR1.forward(features_fused_list[2])
-        features_fused_list[3] = self.DR1.forward(features_fused_list[3])
+        features_fused_list[1] = self.DR2.forward(features_fused_list[1])
+        features_fused_list[2] = self.DR3.forward(features_fused_list[2])
+        features_fused_list[3] = self.DR4.forward(features_fused_list[3])
 
         ss_feature = torch.concat(features_fused_list, -1)  # Its shape becomes: [batch_size, patch_size, patch_size, 4 * 128]
         

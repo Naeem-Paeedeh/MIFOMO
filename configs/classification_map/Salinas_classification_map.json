@@ -18,8 +18,6 @@
     "num_episodes_tests": 1,
     "num_episodes_target1": 500,
     "num_episodes_intermediate_domain": 500,
-    "num_episodes_target2": 500,
-    "num_episodes_target3": 500,
     "num_mixup_target": 10,
     "num_mixup_intermediate": 10,
     "top_k_most_confident": 100,

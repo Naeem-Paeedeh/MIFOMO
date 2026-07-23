@@ -9,6 +9,13 @@ class InitializationType(Enum):
     AlmostDiagonal = 5
     Diagonal = 6
     
+    
+class PEFT_Type(Enum):
+    Disabled = 1
+    CoalescentProjection = 2
+    LoRA = 3
+    Prompt = 4
+    
 
 class Phase(Enum):
     Source = 1
@@ -23,8 +30,3 @@ class DistanceFunction(Enum):
     CosineSimilarity = 3
     L1 = 4
     
-
-# class PatchEmbeddingType(Enum):
-#     Spatial = 1
-#     Spectral = 2
-#     Pixels = 3

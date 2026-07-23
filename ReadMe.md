@@ -20,6 +20,7 @@ You can download the datasets from the following links:
 - [Chikusei dataset](https://naotoyokoya.com/Download.html)
 - [Indian Pines, Salinas, and Pavia University](https://www.ehu.eus/ccwintco/index.php/Hyperspectral_Remote_Sensing_Scenes)
 - [Houston dataset from the CASCL repositoty](https://github.com/Li-ZK/CDFS-CASCL-2024/)
+- [Kennedy Space Center (KSC)](https://rslab.ut.ac.ir/data)
 
 ## How to run
 

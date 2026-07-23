@@ -109,7 +109,7 @@ class Stages:
         self.device = self.mifomo.device
         
     def source_phase(self):
-        ma = sh.MovingAverageDict(20)
+        ma = sh.MovingAverageDict(50)
         
         num_episodes = self.mifomo.num_episodes_source
         
@@ -127,8 +127,6 @@ class Stages:
             embeddings_query = self.mifomo.forward(episode.query_samples, source_or_target=True)
             
             prototypes = sh.compute_prototypes(embeddings_support, episode.support_labels)
-            
-            # assert prototypes.shape[0] == mifomo.num_ways_training
             
             loss_mx = 0.0
             
@@ -162,7 +160,7 @@ class Stages:
             loss_str = f'Loss: {ma['loss']: .5f}'
             report = f'Source domain, Episode: {ep_num + 1}/{num_episodes}, loss: {loss_str}, acc: {ma['acc']: .2f}, {remaining_time_str}'
             sh.print_overwrite(report)
-            if ep_num + 1 % 500 == 0:
+            if (ep_num + 1) % 500 == 0:
                 logging.info(report)
             
             optimizer.zero_grad()
@@ -184,28 +182,28 @@ class Stages:
         num_episodes: int,
         show_arrow: bool = False
     ):
-        acc_without_label_smoothing, acc_with_label_smoothing, A_without_label_smoothing, A_with_label_smoothing, kappa_without_label_smoothing, kappa_with_label_smoothing = self._evaluate_episode(episode=episode_target)
+        acc_without_label_propagation, acc_with_label_propagation, A_without_label_propagation, A_with_label_propagation, kappa_without_label_propagation, kappa_with_label_propagation = self._evaluate_episode(episode=episode_target)
         
         if desc_and_key not in acc_dict:
             acc_dict[desc_and_key] = defaultdict(list)
         
         episode_str = f"Episode: {episode_num + 1}/{num_episodes},"
         
-        acc_dict[desc_and_key]['acc_without_LS'].append(acc_without_label_smoothing)
-        acc_dict[desc_and_key]['A_without_label_smoothing'].append(A_without_label_smoothing)
-        acc_dict[desc_and_key]['kappa_without_label_smoothing'].append(kappa_without_label_smoothing)
+        acc_dict[desc_and_key]['acc_without_LS'].append(acc_without_label_propagation)
+        acc_dict[desc_and_key]['A_without_label_propagation'].append(A_without_label_propagation)
+        acc_dict[desc_and_key]['kappa_without_label_propagation'].append(kappa_without_label_propagation)
         
-        logging.info(f'{episode_str} {desc_and_key}, w/o label smoothing: {acc_without_label_smoothing:.2f}')
+        logging.info(f'{episode_str} {desc_and_key}, w/o label smoothing: {acc_without_label_propagation:.2f}')
         
         suffix = ''
         if show_arrow:
             suffix = '\t<--'
         
-        if self.mifomo.use_label_smoothing:
-            acc_dict[desc_and_key]['acc_with_LS'].append(acc_with_label_smoothing)
-            acc_dict[desc_and_key]['A_with_label_smoothing'].append(A_with_label_smoothing)
-            acc_dict[desc_and_key]['kappa_with_label_smoothing'].append(kappa_with_label_smoothing)
-            logging.info(f'{episode_str} {desc_and_key}, with label smoothing: {acc_with_label_smoothing:.2f}{suffix}')
+        if self.mifomo.use_label_propagation:
+            acc_dict[desc_and_key]['acc_with_LS'].append(acc_with_label_propagation)
+            acc_dict[desc_and_key]['A_with_label_propagation'].append(A_with_label_propagation)
+            acc_dict[desc_and_key]['kappa_with_label_propagation'].append(kappa_with_label_propagation)
+            logging.info(f'{episode_str} {desc_and_key}, with label smoothing: {acc_with_label_propagation:.2f}{suffix}')
     
     def _report_accuracies(
         self,
@@ -239,50 +237,57 @@ class Stages:
             OAStd = np.std(acc_without_LS)
             logging.info(f'{episode_str} Avg. OA, {stage_key}, w/o LS: {OAMean:.2f} ± {OAStd:.2f}{suffix}')
             
-            A_without_label_smoothing = acc_dict[stage_key]['A_without_label_smoothing']
-            kappa_without_label_smoothing = acc_dict[stage_key]['kappa_without_label_smoothing']
-            AA = np.mean(A_without_label_smoothing, 1)
+            A_without_label_propagation = acc_dict[stage_key]['A_without_label_propagation']
+            kappa_without_label_propagation = acc_dict[stage_key]['kappa_without_label_propagation']
+            AA = np.mean(A_without_label_propagation, 1)
             AAMean = np.mean(AA, 0)
             AAStd = np.std(AA)
             logging.info(f"{episode_str} Avg. AA, {stage_key} w/o LS: {100 * AAMean:.2f} ± {100 * AAStd:.2f}")      # 100 * AAStd?
-            kMean = np.mean(kappa_without_label_smoothing)
-            kStd = np.std(kappa_without_label_smoothing)
+            kMean = np.mean(kappa_without_label_propagation)
+            kStd = np.std(kappa_without_label_propagation)
             logging.info(f"{episode_str} Avg. kappa, {stage_key} w/o LS: {100 * kMean:.2f} ± {100 * kStd:.2f}")
             
-            if self.mifomo.use_label_smoothing:
+            if self.mifomo.use_label_propagation:
                 acc_with_LS = acc_dict[stage_key]['acc_with_LS']
                 OAMean = np.mean(acc_with_LS)
                 OAStd = np.std(acc_with_LS)
                 logging.info(f'{episode_str} Avg. OA, {stage_key}, with LS: {OAMean:.2f} ± {OAStd:.2f}{suffix}{suffix2}')
             
-                A_with_label_smoothing = acc_dict[stage_key]['A_with_label_smoothing']
-                AA = np.mean(A_with_label_smoothing, 1)
+                A_with_label_propagation = acc_dict[stage_key]['A_with_label_propagation']
+                AA = np.mean(A_with_label_propagation, 1)
                 AAMean = np.mean(AA, 0)
                 AAStd = np.std(AA)
                 logging.info(f"{episode_str} Avg. AA, {stage_key} with LS: {100 * AAMean:.2f} ± {100 * AAStd:.2f}")
 
-                kappa_with_label_smoothing = acc_dict[stage_key]['kappa_with_label_smoothing']
-                kMean = np.mean(kappa_with_label_smoothing)
-                kStd = np.std(kappa_with_label_smoothing)
+                kappa_with_label_propagation = acc_dict[stage_key]['kappa_with_label_propagation']
+                kMean = np.mean(kappa_with_label_propagation)
+                kStd = np.std(kappa_with_label_propagation)
                 logging.info(f"{episode_str} Avg. kappa, {stage_key} with LS: {100 * kMean:.2f} ± {100 * kStd:.2f}")
 
-                AMean = np.mean(A_with_label_smoothing, 0)
-                AStd = np.std(A_with_label_smoothing, 0)
+                AMean = np.mean(A_with_label_propagation, 0)
+                AStd = np.std(A_with_label_propagation, 0)
             else:
-                AMean = np.mean(A_without_label_smoothing, 0)
-                AStd = np.std(A_without_label_smoothing, 0)
+                AMean = np.mean(A_without_label_propagation, 0)
+                AStd = np.std(A_without_label_propagation, 0)
 
             if i == 5 or i == len(stages_keys_list) - 1 or stage_key == 'acc_after_intermediate_domain_training':
                 logging.info(f"{episode_str} Accuracy for each class:")
                 for i in range(self.mifomo.num_classes_target):
                     logging.info(f"Class {i + 1}: {100 * AMean[i]:.2f} ± {100 * AStd[i]:.2f}")
+                    
+                logging.info(f"{episode_str} Class accuracies for LaTeX:")
+                temp_str = ""
+                for i in range(self.mifomo.num_classes_target):
+                    temp_str += f"{100 * AMean[i]:.2f} & "
+                    # if i < self.mifomo.num_classes_target - 1:
+                    #     temp_str += " &"
+                logging.info(temp_str)
         
         logging.info('*' * 70)
     
     def intermediate_phase(
         self,
     ):
-        optimizer = self.mifomo.obtain_the_optimizer()
         acc_dict = {}
         
         stages_keys_list = [
@@ -294,36 +299,51 @@ class Stages:
         
         num_episodes_tests = self.mifomo.num_episodes_tests       # 10 # nDataSet in other codes
         
+        torch.cuda.empty_cache()
+        
         eta = sh.ETA(total_tasks=num_episodes_tests)
         
         LS_status = ''
-        if not self.mifomo.use_label_smoothing:
+        if not self.mifomo.use_label_propagation:
             LS_status = ',WO_LS'
             
         episode_target: sh.EpisodeContainer = None
         
         for ep_num in range(num_episodes_tests):
             self.mifomo.reset_the_model()
+            torch.cuda.reset_peak_memory_stats()
+            optimizer = self.mifomo.obtain_the_optimizer()
+            
+            timer_training = sh.MyTimer(device=self.device)
             
             sh.set_seed(self.mifomo.seed + ep_num)
             
             episode_target = self.mifomo.generate_an_episode(source_or_target=False)
+            
+            timer_training.accumulate()
+            
             self._evaluate_save_in_dict_and_report_accuracy(acc_dict=acc_dict, desc_and_key=stages_keys_list[0], episode_target=episode_target, episode_num=ep_num, num_episodes=num_episodes_tests)
             
             # We train the network on the target domain with the support set to be able to assign pseudo-labels to the query set samples.
             episode_str_for_cache_file = f'DS={self.mifomo.dataset_name_target},n_ep_target1={self.mifomo.num_episodes_target1}'
             
             if self.mifomo.perform_the_intermediate_domain_training:
+                timer_training.reset_start_time()
+                
                 self.prepare_for_pseudo_labeling(optimizer=optimizer, episode_target=episode_target, num_episodes=self.mifomo.num_episodes_target1, cache_file=f'step1,{episode_str_for_cache_file}{LS_status},episode={ep_num}.pth')
+                
+                timer_training.accumulate()
                 
                 self._evaluate_save_in_dict_and_report_accuracy(acc_dict=acc_dict, desc_and_key=stages_keys_list[1], episode_target=episode_target, show_arrow=True, episode_num=ep_num, num_episodes=num_episodes_tests)
             
+                timer_training.reset_start_time()
+                
                 # We assign pseudo-labels to the query set samples of the target domain.
-                # if mifomo.use_label_smoothing:
+                # if mifomo.use_label_propagation:
                 # query_predicted.shape: [num_samples, num_ways]
                 query_target_predicted_without_LS, query_target_predicted_with_LS = self.predict_query_labels(episode=episode_target)
                 
-                if self.mifomo.use_label_smoothing:
+                if self.mifomo.use_label_propagation:
                     query_target_predicted = query_target_predicted_with_LS
                 else:
                     query_target_predicted = query_target_predicted_without_LS
@@ -346,8 +366,24 @@ class Stages:
                     cache_file=f'step2,{episode_str_for_cache_file}{LS_status},episode={ep_num}.pth'
                     # cache_file=None
                 )
+                
+                timer_training.accumulate()
+                
+                timer_inference = sh.MyTimer(device=self.device)
                     
                 self._evaluate_save_in_dict_and_report_accuracy(acc_dict=acc_dict, desc_and_key=stages_keys_list[2], episode_target=episode_target, episode_num=ep_num, num_episodes=num_episodes_tests)
+                
+                timer_inference.accumulate()
+                
+                logging.info(f"Train time: {timer_training.obtain_accumulated_time_in_seconds()}")
+                logging.info(f"Inference time: {timer_inference.obtain_accumulated_time_in_seconds()}")
+                
+                peak_bytes = torch.cuda.max_memory_allocated()
+                peak_gb = peak_bytes / (1024 ** 2)
+                logging.info(f"Peak GPU Memory Allocated: {peak_gb:.2f} MB")
+                
+                # if ep_num == 0 and detailed_memory_consumption_report:
+                #     logging.info(torch.cuda.memory_summary(device=None, abbreviated=False))
                
             self._report_accuracies(
                 acc_dict=acc_dict,
@@ -410,9 +446,13 @@ class Stages:
             keep_classes_with_insufficient_samples=True
         )
         
-        ma = sh.MovingAverageDict(20)
+        ma = sh.MovingAverageDict(50)
         eta = sh.ETA(total_tasks=num_episodes)
-        ms = MixupScheduler(total_iterations=num_episodes, temperature=self.mifomo.temperature_mixup_scheduler)
+        ms = MixupScheduler(
+            total_iterations=num_episodes,
+            temperature=self.mifomo.temperature_mixup_scheduler,
+            perturbation_range=self.mifomo.perturbation_range
+        )
         
         for ep_num in range(num_episodes):
             episode_source = source_EpisodeGenerator.generate()
@@ -485,15 +525,15 @@ class Stages:
         if self.mifomo.try_cache_first(cache_file):
             return
         
-        ma = sh.MovingAverageDict(10)
+        ma = sh.MovingAverageDict(50)
         
         eta = sh.ETA(total_tasks=num_episodes)
         
         self.mifomo.train()
         
-        optimizer = self.mifomo.obtain_the_optimizer()
-        
         for ep_num in range(num_episodes):
+            optimizer = self.mifomo.obtain_the_optimizer()
+            
             episode_new = self.divide_support_set_to_support_and_query_sets(episode_target=episode_target)
             
             embeddings_new_support = self.mifomo.forward(episode_new.support_samples, source_or_target=False)
@@ -568,29 +608,33 @@ class Stages:
         dataset = TensorDataset(query_samples)
         dataloader = DataLoader(dataset, batch_size=self.mifomo.batch_size_LGC, drop_last=False)
         
-        logits_all_before_label_smoothing = torch.Tensor()
-        logits_all_after_label_smoothing = None
+        logits_all_before_label_propagation = torch.Tensor()
+        logits_all_after_label_propagation = None
         
-        if self.mifomo.use_label_smoothing:
-            lgc = LGC(distance_function=self.mifomo.distance_function)
-            logits_all_after_label_smoothing = torch.Tensor()
+        if self.mifomo.use_label_propagation:
+            lgc = LGC(
+                alpha=self.mifomo.LGC_alpha,
+                sigma=self.mifomo.LGC_sigma,
+                distance_function=self.mifomo.distance_function
+            )
+            logits_all_after_label_propagation = torch.Tensor()
             
         for x, in dataloader:
             query_embeddings = self.mifomo.forward(x, source_or_target=source_or_target).cpu()
         
             query_logits = self.mifomo.prototypical_classifier.predict(features=query_embeddings, prototypes=prototypes, return_labels_or_logits=False)      # Its shape: [num_samples, num_ways]
             
-            logits_all_before_label_smoothing = torch.cat([logits_all_before_label_smoothing, query_logits])
+            logits_all_before_label_propagation = torch.cat([logits_all_before_label_propagation, query_logits])
             
-            if self.mifomo.use_label_smoothing:
-                logits_after_label_smoothing = lgc.compute(x=torch.cat([support_embeddings, query_embeddings]), y_bar=torch.cat([support_logits, query_logits]))
-                logits_after_label_smoothing_after_discarding_the_support_set = logits_after_label_smoothing[support_samples.shape[0]:]
-                logits_all_after_label_smoothing = torch.cat([logits_all_after_label_smoothing, logits_after_label_smoothing_after_discarding_the_support_set])
+            if self.mifomo.use_label_propagation:
+                logits_after_label_propagation = lgc.compute(x=torch.cat([support_embeddings, query_embeddings]), y_bar=torch.cat([support_logits, query_logits]))
+                logits_after_label_propagation_after_discarding_the_support_set = logits_after_label_propagation[support_samples.shape[0]:]
+                logits_all_after_label_propagation = torch.cat([logits_all_after_label_propagation, logits_after_label_propagation_after_discarding_the_support_set])
             
-        if self.mifomo.use_label_smoothing:
-            logits_all_after_label_smoothing = logits_all_after_label_smoothing.detach()
+        if self.mifomo.use_label_propagation:
+            logits_all_after_label_propagation = logits_all_after_label_propagation.detach()
         
-        return logits_all_before_label_smoothing.detach(), logits_all_after_label_smoothing   # Its shape: [num_samples, num_ways]
+        return logits_all_before_label_propagation.detach(), logits_all_after_label_propagation   # Its shape: [num_samples, num_ways]
     
     def divide_support_set_to_support_and_query_sets(
         self,
@@ -643,37 +687,37 @@ class Stages:
     ):
         self.mifomo.eval()
         
-        scores_without_label_smoothing, scores_with_label_smoothing = self.predict_query_labels(episode=episode)
+        scores_without_label_propagation, scores_with_label_propagation = self.predict_query_labels(episode=episode)
         
-        labels_query_predicted_without_label_smoothing = torch.argmax(scores_without_label_smoothing, dim=-1)
+        labels_query_predicted_without_label_propagation = torch.argmax(scores_without_label_propagation, dim=-1)
         # Overall Accuracy (OA)
-        acc_without_label_smoothing = sh.calculate_accuracy(predictions=labels_query_predicted_without_label_smoothing, real_labels=episode.query_labels)
+        acc_without_label_propagation = sh.calculate_accuracy(predictions=labels_query_predicted_without_label_propagation, real_labels=episode.query_labels)
         
         # For Average Accuracy (AA)
-        confusion_matrix = metrics.confusion_matrix(episode.query_labels.cpu().numpy(), labels_query_predicted_without_label_smoothing.cpu().numpy())
-        A_without_label_smoothing = np.diag(confusion_matrix) / np.sum(confusion_matrix, 1, dtype=np.float64)
+        confusion_matrix = metrics.confusion_matrix(episode.query_labels.cpu().numpy(), labels_query_predicted_without_label_propagation.cpu().numpy())
+        A_without_label_propagation = np.diag(confusion_matrix) / np.sum(confusion_matrix, 1, dtype=np.float64)
         
         # Kappa
-        kappa_without_label_smoothing = metrics.cohen_kappa_score(episode.query_labels.cpu().numpy(), labels_query_predicted_without_label_smoothing.cpu().numpy())
+        kappa_without_label_propagation = metrics.cohen_kappa_score(episode.query_labels.cpu().numpy(), labels_query_predicted_without_label_propagation.cpu().numpy())
         
-        if self.mifomo.use_label_smoothing:
-            labels_query_predicted_with_label_smoothing = torch.argmax(scores_with_label_smoothing, dim=-1)
+        if self.mifomo.use_label_propagation:
+            labels_query_predicted_with_label_propagation = torch.argmax(scores_with_label_propagation, dim=-1)
         
             # Overall Accuracy (OA)
-            acc_with_label_smoothing = sh.calculate_accuracy(predictions=labels_query_predicted_with_label_smoothing, real_labels=episode.query_labels)
+            acc_with_label_propagation = sh.calculate_accuracy(predictions=labels_query_predicted_with_label_propagation, real_labels=episode.query_labels)
         
             # For Average Accuracy (AA)
-            confusion_matrix = metrics.confusion_matrix(episode.query_labels.cpu().numpy(), labels_query_predicted_with_label_smoothing.cpu().numpy())
-            A_with_label_smoothing = np.diag(confusion_matrix) / np.sum(confusion_matrix, 1, dtype=np.float64)
+            confusion_matrix = metrics.confusion_matrix(episode.query_labels.cpu().numpy(), labels_query_predicted_with_label_propagation.cpu().numpy())
+            A_with_label_propagation = np.diag(confusion_matrix) / np.sum(confusion_matrix, 1, dtype=np.float64)
             
             # Kappa
-            kappa_with_label_smoothing = metrics.cohen_kappa_score(episode.query_labels.cpu().numpy(), labels_query_predicted_with_label_smoothing.cpu().numpy())
+            kappa_with_label_propagation = metrics.cohen_kappa_score(episode.query_labels.cpu().numpy(), labels_query_predicted_with_label_propagation.cpu().numpy())
         else:
-            acc_with_label_smoothing = 0.0
-            A_with_label_smoothing = 0.0
-            kappa_with_label_smoothing = 0.0
+            acc_with_label_propagation = 0.0
+            A_with_label_propagation = 0.0
+            kappa_with_label_propagation = 0.0
         
-        return acc_without_label_smoothing, acc_with_label_smoothing, A_without_label_smoothing, A_with_label_smoothing, kappa_without_label_smoothing, kappa_with_label_smoothing
+        return acc_without_label_propagation, acc_with_label_propagation, A_without_label_propagation, A_with_label_propagation, kappa_without_label_propagation, kappa_with_label_propagation
     
     def save_embedding_for_t_SNE(
         self,
@@ -700,14 +744,12 @@ class Stages:
         self.mifomo.eval()
         samples = episode.query_samples
         labels = episode.query_labels
-        # query_labels = episode.query_labels
         
         self.mifomo.eval()
         
         dataset = TensorDataset(samples, labels)
         dataloader = DataLoader(dataset, batch_size=80, drop_last=False)
         
-        # embeddings_all = torch.Tensor()
         embeddings_all = torch.Tensor()
         labels_all = torch.Tensor().to(torch.long)
         
@@ -742,7 +784,7 @@ class Stages:
         
         classification_map_flattened = torch.zeros_like(gt_matrix_flattened)
         
-        _, scores_with_label_smoothing = self.predict_query_labels(episode=episode)
+        _, scores_with_label_propagation = self.predict_query_labels(episode=episode)
         
         positions_labeled_samples = torch.nonzero(gt_matrix_flattened > 0, as_tuple=False).squeeze()
         indices_support_mapped = positions_labeled_samples[episode.support_set_indices_list]
@@ -760,7 +802,7 @@ class Stages:
         else:
             indices_query_mapped = positions_labeled_samples[episode.query_set_indices_list]
     
-        classification_map_flattened[indices_query_mapped] = scores_with_label_smoothing.argmax(dim=-1) + 1  # Background is zero.
+        classification_map_flattened[indices_query_mapped] = scores_with_label_propagation.argmax(dim=-1) + 1  # Background is zero.
         
         classification_map_flattened = map_to_real_labels[classification_map_flattened]
         
@@ -822,6 +864,7 @@ class Stages:
 
 
 def main():
+    
     
     parser = argparse.ArgumentParser()
     parser.add_argument("-s", "--settings_file", type=str, default='configs/Indian_pines.json')

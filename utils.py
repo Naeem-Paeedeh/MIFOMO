@@ -1,8 +1,3 @@
-# https://github.com/Qba-heu/FDFSL
-# https://github.com/WHU-Sigma/HyperSIGMA
-# https://github.com/Li-ZK/CDFS-CASCL-2024
-# https://github.com/Naeem-Paeedeh/CPLSR
-
 import numpy as np
 import random
 import scipy.io as sio
@@ -20,99 +15,6 @@ from torch.utils.data.sampler import Sampler
 from torch import Tensor as T
 import torch.nn.functional as F
 import einops as eo
-        
-
-def weights_init(m):
-    if isinstance(m, (nn.Conv3d, nn.Conv2d, nn.Conv1d)):
-        nn.init.xavier_uniform_(m.weight, gain=1)
-        if m.bias is not None:
-            m.bias.data.zero_()
-    elif isinstance(m, (nn.BatchNorm3d, nn.BatchNorm2d, nn.BatchNorm1d)):
-        if m.weight is not None:
-            nn.init.normal_(m.weight, 1.0, 0.02)
-        if m.bias is not None:
-            m.bias.data.zero_()
-    elif isinstance(m, nn.Linear):
-        nn.init.xavier_normal_(m.weight)
-        if m.bias is not None:
-            m.bias.data = torch.ones(m.bias.data.size())
-
-
-class matcifar(Dataset):
-    def __init__(self, imdb, train, d, medicinal):
-        
-        # This class:
-        # - Selects training and test samples from the imdb['set']
-        # - Tranpose them to (N, num_bands, patch_height, patch_width)
-
-        self.train = train  # training set or test set
-        self.imdb = imdb
-        self.d = d
-        self.x1 = np.argwhere(self.imdb['set'] == 1)    # Training
-        self.x2 = np.argwhere(self.imdb['set'] == 3)    # Testing
-        self.x1 = self.x1.flatten()
-        self.x2 = self.x2.flatten()
-
-        if medicinal == 1:
-            self.train_data = self.imdb['data'][self.x1, :, :, :]
-            self.train_labels = self.imdb['Labels'][self.x1]
-            self.test_data = self.imdb['data'][self.x2, :, :, :]
-            self.test_labels = self.imdb['Labels'][self.x2]
-        else:       # Default condition as matcifar( is always 0
-            self.train_data = self.imdb['data'][:, :, :, self.x1]
-            self.train_labels = self.imdb['Labels'][self.x1]
-            self.test_data = self.imdb['data'][:, :, :, self.x2]
-            self.test_labels = self.imdb['Labels'][self.x2]
-            if self.d == 3:
-                self.train_data = self.train_data.transpose((3, 2, 0, 1))
-                self.test_data = self.test_data.transpose((3, 2, 0, 1))
-            else:
-                self.train_data = self.train_data.transpose((3, 0, 2, 1))
-                self.test_data = self.test_data.transpose((3, 0, 2, 1))
-
-    def __getitem__(self, index):
-        """
-        Args:
-            index (int): Index
-        Returns:
-            tuple: (image, target) where target is index of the target class.
-        """
-        if self.train:
-
-            img, target = self.train_data[index], self.train_labels[index]
-        else:
-
-            img, target = self.test_data[index], self.test_labels[index]
-
-        return img, target
-
-    def __len__(self):
-        if self.train:
-            return len(self.train_data)
-        else:
-            return len(self.test_data)
-
-
-def sanity_check(all_set):
-    nclass = 0
-    nsamples = 0
-    all_good = {}
-    
-    for class_ in all_set:
-        if len(all_set[class_]) >= 100:
-            all_good[class_] = all_set[class_][:100]
-            nclass += 1
-            nsamples += len(all_good[class_])
-    
-    print('the number of class:', nclass)
-    print('the number of sample:', nsamples)
-    return all_good
-
-
-def radiation_noise(data, alpha_range=(0.9, 1.1), beta=1 / 25):
-    alpha = np.random.uniform(*alpha_range)
-    noise = np.random.normal(loc=0., scale=1.0, size=data.shape)
-    return alpha * data + beta * noise
 
 
 def load_data(data_path, image_file, label_file):
@@ -555,3 +457,32 @@ class myDataset(torch.utils.data.Dataset):
     def __len__(self):
         # 返回文件数据的数目
         return self.len
+    
+    
+def show_number_of_parameters_in_pramas_groups(params_all: list, logger):
+    num_parameters = 0
+    
+    for param_list1 in params_all:
+        num_parameters_comp = 0
+        
+        for p in param_list1['params']:
+            if p.requires_grad:
+                num_parameters_comp += p.numel()
+    
+        num_parameters += num_parameters_comp
+        logger.info(f"Number of learnable parameters of {param_list1['name']}: {num_parameters_comp}")
+    
+    logger.info(f'Total number of learnable parameters: {num_parameters}')
+    
+
+def synchronize(device):
+    if device is not None:
+        torch.cuda.synchronize(device)
+    
+    
+# References:
+# https://github.com/Naeem-Paeedeh/CVLC
+# https://github.com/Qba-heu/FDFSL
+# https://github.com/WHU-Sigma/HyperSIGMA
+# https://github.com/Li-ZK/CDFS-CASCL-2024
+# https://github.com/Naeem-Paeedeh/CPLSR

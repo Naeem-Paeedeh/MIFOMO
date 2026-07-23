@@ -27,6 +27,7 @@
 #   year={2003},
 #   url={https://api.semanticscholar.org/CorpusID:508435}
 # }
+
 # This code is modified from https://github.com/provezano/lgc
 import torch
 from torch import Tensor as T
@@ -55,12 +56,13 @@ class LGC:
     Learning with Local and Global Consistency (LGC) algorithm
     """
     
-    def __init__(self,
-                 alpha=0.9,
-                 sigma=50,
-                 rcond_for_pinv=1e-5,
-                 distance_function: nt.DistanceFunction = nt.DistanceFunction.Euclidean,
-                 ):
+    def __init__(
+        self,
+        alpha: float = 0.9,
+        sigma: float = 50.0,
+        rcond_for_pinv=1e-5,
+        distance_function: nt.DistanceFunction = nt.DistanceFunction.Euclidean,
+    ) -> None:
         self.alpha = alpha
         self.sigma = sigma
         self.rcond_for_pinv = rcond_for_pinv
